@@ -35,6 +35,7 @@ THE SOFTWARE.
 
 #include <stdlib.h>
 #include <windows.h>
+#include <io.h>
 #include <fcntl.h>
 
 #include "lua.h"
@@ -46,7 +47,7 @@ THE SOFTWARE.
 #define debug(...) /* fprintf(stderr, __VA_ARGS__) */
 #define debug_stack(L) /* #include "../lds.c" */
 
-#define file_handle(fp) (HANDLE)_get_osfhandle(fileno(fp))
+#define file_handle(fp) (HANDLE)_get_osfhandle(_fileno(fp))
 
 /* Push nil, followed by the Windows error message corresponding to
  * the error number, or a string giving the error value in decimal if
@@ -113,6 +114,26 @@ int lc_environ(lua_State *L)
     lua_pushlstring(L, val, end - val);
     lua_settable(L, -3);
   }
+  return 1;
+}
+
+/* -- pathname/nil error */
+int lc_currentdir(lua_State *L)
+{
+  char pathname[MAX_PATH + 1];
+  size_t len = GetCurrentDirectory(sizeof pathname, pathname);
+  if (len == 0) return push_error(L);
+  lua_pushlstring(L, pathname, len);
+  return 1;
+}
+
+/* pathname -- true/nil error */
+int lc_chdir(lua_State *L)
+{
+  const char *pathname = luaL_checkstring(L, 1);
+  if (!SetCurrentDirectory(pathname))
+    return push_error(L);
+  lua_pushboolean(L, 1);
   return 1;
 }
 
@@ -200,6 +221,8 @@ static struct spawn_params *spawn_param_init(lua_State *L)
   p->L = L;
   p->cmdline = p->environment = 0;
   p->si = si;
+  p->si.dwFlags = STARTF_USESHOWWINDOW;
+  p->si.wShowWindow = SW_HIDE;
   return p;
 }
 
@@ -313,10 +336,11 @@ static int spawn_param_execute(struct spawn_params *p)
   luaL_getmetatable(L, PROCESS_HANDLE);
   lua_setmetatable(L, -2);
   proc->status = -1;
-  c = strdup(p->cmdline);
-  e = (char *)p->environment; /* strdup(p->environment); */
+  c = _strdup(p->cmdline);
+  e = (char *)p->environment; /* _strdup(p->environment); */
   /* XXX does CreateProcess modify its environment argument? */
   ret = CreateProcess(0, c, 0, 0, TRUE, 0, e, 0, &p->si, &pi);
+  CloseHandle(pi.hThread);
   /* if (e) free(e); */
   free(c);
   if (!ret)
@@ -326,19 +350,65 @@ static int spawn_param_execute(struct spawn_params *p)
   return 1;
 }
 
-/* proc -- exitcode/nil error */
+
+BOOL _process_terminate(struct process *p);
+DWORD _process_wait(struct process *p, int blocking);
+
+BOOL _process_terminate(struct process *p) {
+  if (p->status == -1) {
+    return TerminateProcess(p->hProcess, 0);
+  }
+  return TRUE;
+}
+
+/* proc -- */
+int process_terminate(lua_State *L)
+{
+  struct process *p = luaL_checkudata(L, 1, PROCESS_HANDLE);
+  if ( ! _process_terminate(p)) {
+    return push_error(L);
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+DWORD _process_wait(struct process *p, int blocking) {
+  DWORD timeout = (blocking) ? (INFINITE) : (0);
+  DWORD ret = WaitForSingleObject(p->hProcess, timeout);
+  return ret;
+}
+
+/* proc [blocking] -- exitcode/true timeout/nil error */
 int process_wait(lua_State *L)
 {
   struct process *p = luaL_checkudata(L, 1, PROCESS_HANDLE);
+  int blocking  = 1;                    /* true */
+  DWORD exitcode;
+  if (lua_isboolean(L, 2)) {
+    blocking  = lua_toboolean(L, 2);
+  }
   if (p->status == -1) {
-    DWORD exitcode;
-    if (WAIT_FAILED == WaitForSingleObject(p->hProcess, INFINITE)
-        || !GetExitCodeProcess(p->hProcess, &exitcode))
+    DWORD ret = _process_wait(p, blocking);
+    if (WAIT_FAILED == ret
+        || !GetExitCodeProcess(p->hProcess, &exitcode)) {
       return push_error(L);
+    }
+    else if (WAIT_TIMEOUT == ret) {
+      lua_pushboolean(L, 1);
+      return 1;
+    }
     p->status = exitcode;
+    CloseHandle(p->hProcess);
   }
   lua_pushnumber(L, p->status);
   return 1;
+}
+
+int process_gc(lua_State *L) {
+  struct process *p = luaL_checkudata(L, 1, PROCESS_HANDLE);
+  _process_terminate(p);
+  _process_wait(p, 1);
+  return 0;
 }
 
 /* proc -- string */
@@ -454,6 +524,224 @@ int lc_spawn(lua_State *L)
   }
   return spawn_param_execute(params);   /* proc/nil error */
 }
+
+struct DIR_tag {
+  int first;
+  HANDLE hf;
+  WIN32_FIND_DATA fd;
+};
+typedef struct DIR_tag DIR;
+
+static char *mkpattern(const char *name)
+{
+  static const char suffix[] = "\\*";
+  size_t len = strlen(name);
+  char *pattern = malloc(len + sizeof suffix);
+  if (pattern)
+    strcpy((char*)memcpy(pattern, name, len) + len, suffix);
+  return pattern;
+}
+
+DIR *opendir(const char *name)
+{
+  DIR *pi = malloc(sizeof *pi);
+  char *pattern = mkpattern(name);
+  if (!pi || !pattern
+      || INVALID_HANDLE_VALUE == (pi->hf = FindFirstFile(pattern, &pi->fd))) {
+    free(pi);
+    pi = 0;
+  }
+  else {
+    pi->first = 1;
+  }
+  free(pattern);
+  return pi;
+}
+
+static int isdotfile(const char *name)
+{
+  return name[0] == '.' && (name[1] == 0
+    || (name[1] == '.' && name[2] == 0));
+}
+
+const WIN32_FIND_DATA *readdir(DIR *pi)
+{
+  switch (pi->first) do {
+  default:
+    if (!FindNextFile(pi->hf, &pi->fd)) {
+      FindClose(pi->hf);
+      pi->hf = INVALID_HANDLE_VALUE;
+      return 0;
+    }
+  case 1: pi->first = 0;
+  } while (isdotfile(pi->fd.cFileName));
+  return &pi->fd;
+}
+
+void closedir(DIR *pi)
+{
+  if (pi->hf != INVALID_HANDLE_VALUE) {
+      FindClose(pi->hf);
+      pi->hf = INVALID_HANDLE_VALUE;
+  }
+  free(pi);
+}
+
+static lua_Number qword_to_number(DWORD hi, DWORD lo)
+{
+  /* lua_Number must be floating-point or as large or larger than
+   * two DWORDs in order to be considered adequate for representing
+   * large file sizes */
+  lua_assert(hi == 0
+         || (lua_Number)0.5 > 0
+         || sizeof(lua_Number) > 2 * sizeof(DWORD)
+         || !"lua_Number cannot adequately represent large file sizes" );
+  return hi * (1.0 + (DWORD)-1) + lo;
+}
+
+static lua_Number get_file_size(const char *name)
+{
+  HANDLE h = CreateFile(name, GENERIC_READ, FILE_SHARE_READ, 0,
+                        OPEN_EXISTING, 0, 0);
+  DWORD lo, hi;
+  lua_Number size;
+  if (h == INVALID_HANDLE_VALUE)
+    size = 0;
+  else {
+    lo = GetFileSize(h, &hi);
+    if (lo == INVALID_FILE_SIZE && GetLastError() != NO_ERROR)
+      size = 0;
+    else
+      size = qword_to_number(hi, lo);
+    CloseHandle(h);
+  }
+  return size;
+}
+
+#define new_dirent(L) lua_newtable(L)
+
+/* pathname/file [entry] -- entry */
+int lc_dirent(lua_State *L)
+{
+  int isdir;
+  lua_Number size;
+  DWORD attr;
+  switch (lua_type(L, 1)) {
+  default: return luaL_error(L, "expected file or pathname for argument %d, got dirent", 1);
+  case LUA_TSTRING: {
+    const char *name = lua_tostring(L, 1);
+    attr = GetFileAttributes(name);
+    if (attr == (DWORD)-1)
+      return push_error(L);
+    isdir = attr & FILE_ATTRIBUTE_DIRECTORY;
+    if (isdir)
+      size = 0;
+    else
+      size = get_file_size(name);
+    } break;
+  case LUA_TUSERDATA: {
+    FILE *f = check_file(L, 1, NULL);
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(file_handle(f), &info))
+      return push_error(L);
+    attr = info.dwFileAttributes;
+    isdir = attr & FILE_ATTRIBUTE_DIRECTORY;
+    size = qword_to_number(info.nFileSizeHigh, info.nFileSizeLow);
+    } break;
+  }
+  if (lua_type(L, 2) != LUA_TTABLE) {
+    lua_settop(L, 1);
+    new_dirent(L);
+  }
+  else {
+    lua_settop(L, 2);
+  }
+  if (isdir)
+    lua_pushliteral(L, "directory");
+  else
+    lua_pushliteral(L, "file");
+  lua_setfield(L, 2, "type");
+  lua_pushnumber(L, size);
+  lua_setfield(L, 2, "size");
+  return 1;
+}
+
+/* ...diriter... -- ...diriter... pathname */
+static int diriter_getpathname(lua_State *L, int index)
+{
+  lua_pushvalue(L, index);
+  lua_gettable(L, LUA_REGISTRYINDEX);
+  return 1;
+}
+
+/* ...diriter... pathname -- ...diriter... */
+static int diriter_setpathname(lua_State *L, int index)
+{
+  size_t len;
+  const char *path = lua_tolstring(L, -1, &len);
+  if (path && path[len - 1] != *LUA_DIRSEP) {
+    lua_pushliteral(L, LUA_DIRSEP);
+    lua_concat(L, 2);
+  }
+  lua_pushvalue(L, index);              /* ... pathname diriter */
+  lua_insert(L, -2);                    /* ... diriter pathname */
+  lua_settable(L, LUA_REGISTRYINDEX);   /* ... */
+  return 0;
+}
+
+/* diriter -- diriter */
+static int diriter_close(lua_State *L)
+{
+  DIR **pd = lua_touserdata(L, 1);
+  if (*pd) {
+    closedir(*pd);
+    *pd = 0;
+  }
+  lua_pushnil(L);
+  diriter_setpathname(L, 1);
+  return 0;
+}
+
+/* pathname -- iter state nil */
+/* diriter ... -- entry */
+int lc_dir(lua_State *L)
+{
+  const char *pathname;
+  DIR **pd;
+  const WIN32_FIND_DATA *d;
+  switch (lua_type(L, 1)) {
+  default: return luaL_error(L, "expected pathname for argument %d, got dir", 1);
+  case LUA_TNONE:
+	lua_pushliteral(L, ".");
+  case LUA_TSTRING:
+    pathname = lua_tostring(L, 1);
+    lua_pushcfunction(L, lc_dir);       /* pathname ... iter */
+    pd = lua_newuserdata(L, sizeof *pd);/* pathname ... iter state */
+    *pd = opendir(pathname);
+    if (!*pd) return push_error(L);
+    luaL_getmetatable(L, DIR_HANDLE);   /* pathname ... iter state M */
+    lua_setmetatable(L, -2);            /* pathname ... iter state */
+    lua_pushvalue(L, 1);                /* pathname ... iter state pathname */
+    diriter_setpathname(L, -2);         /* pathname ... iter state */
+    return 2;
+  case LUA_TUSERDATA:
+    pd = luaL_checkudata(L, 1, DIR_HANDLE);
+    do d = readdir(*pd);
+    while (d && isdotfile(d->cFileName));
+    if (!d) return push_error(L);
+    new_dirent(L);                      /* diriter ... entry */
+    diriter_getpathname(L, 1);          /* diriter ... entry dir */
+    lua_pushstring(L, d->cFileName);    /* diriter ... entry dir name */
+    lua_pushvalue(L, -1);               /* diriter ... entry dir name name */
+    lua_setfield(L, -4, "name");        /* diriter ... entry dir name */
+    lua_concat(L, 2);                   /* diriter ... entry fullpath */
+    lua_replace(L, 1);                  /* fullpath ... entry */
+    lua_replace(L, 2);                  /* fullpath entry ... */
+    return lc_dirent(L);
+  }
+  /*NOTREACHED*/
+}
+
 
 #endif // USE_WINDOWS
 

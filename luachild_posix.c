@@ -38,6 +38,9 @@ THE SOFTWARE.
 #include <fcntl.h>
 #include <sys/wait.h>
 
+#include <dirent.h>
+#include <sys/stat.h>
+
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
@@ -97,6 +100,26 @@ int lc_environ(lua_State *L)
     lua_pushlstring(L, val, end - val);
     lua_settable(L, -3);
   }
+  return 1;
+}
+
+/* -- pathname/nil error */
+int lc_currentdir(lua_State *L)
+{
+  char pathname[PATH_MAX + 1];
+  if (!getcwd(pathname, sizeof pathname))
+    return push_error(L);
+  lua_pushstring(L, pathname);
+  return 1;
+}
+
+/* pathname -- true/nil error */
+int lc_chdir(lua_State *L)
+{
+  const char *pathname = luaL_checkstring(L, 1);
+  if (-1 == chdir(pathname))
+    return push_error(L);
+  lua_pushboolean(L, 1);
   return 1;
 }
 
@@ -203,18 +226,64 @@ struct process {
   pid_t pid;
 };
 
-/* proc -- exitcode/nil error */
+int _process_wait(struct process *p, int blocking, int *status);
+int _process_terminate(struct process *p);
+
+int _process_terminate(struct process *p) {
+  if (p->status == -1) {
+    return kill(p->pid, SIGTERM);
+  }
+  return 0;
+}
+
+/* proc -- */
+int process_terminate(lua_State *L)
+{
+  struct process *p = luaL_checkudata(L, 1, PROCESS_HANDLE);
+  if (-1 == _process_terminate(p)) {
+    return push_error(L);
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int _process_wait(struct process *p, int blocking, int *status) {
+  int options = (blocking) ? (0) : (WNOHANG);
+  int ret = waitpid(p->pid, status, options);
+  return ret;
+}
+
+/* proc [blocking] -- exitcode/true timeout/nil error */
 int process_wait(lua_State *L)
 {
   struct process *p = luaL_checkudata(L, 1, PROCESS_HANDLE);
+  int blocking  = 1;                    /* true */
+  int status;
+  if (lua_isboolean(L, 2)) {
+    blocking  = lua_toboolean(L, 2);
+  }
   if (p->status == -1) {
-    int status;
-    if (-1 == waitpid(p->pid, &status, 0))
+    int ret = _process_wait(p, blocking, &status);
+    if (-1 == ret) {
       return push_error(L);
+    }
+    else if (0 == ret) {
+      lua_pushboolean(L, 1);
+      return 1;
+    }
     p->status = WEXITSTATUS(status);
   }
   lua_pushnumber(L, p->status);
   return 1;
+}
+
+/* proc -- nil */
+int process_gc(lua_State *L) {
+  struct process *p = luaL_checkudata(L, 1, PROCESS_HANDLE);
+  int status;
+  _process_terminate(p);
+  _process_wait(p, 1, &status);
+  return 0;
 }
 
 /* proc -- string */
@@ -367,7 +436,6 @@ static FILE *check_file(lua_State *L, int idx, const char *argname)
 }
 
 #define new_dirent(L) lua_newtable(L)
-#define DIR_HANDLE "DIR*"
 
 static void get_redirect(lua_State *L,
                          int idx, const char *stdname, struct spawn_params *p)
@@ -453,6 +521,122 @@ int lc_spawn(lua_State *L)
     get_redirect(L, 2, "stderr", params);   /* cmd opts ... */
   }
   return spawn_param_execute(params);   /* proc/nil error */
+}
+
+#define new_dirent(L) lua_newtable(L)
+
+/* pathname/file [entry] -- entry */
+int lc_dirent(lua_State *L)
+{
+  struct stat st;
+  switch (lua_type(L, 1)) {
+  default: return luaL_error(L, "expected file or pathname for argument %d, got dirent", 1);
+  case LUA_TSTRING: {
+    const char *name = lua_tostring(L, 1);
+    if (-1 == stat(name, &st))
+      return push_error(L);
+    } break;
+  case LUA_TUSERDATA: {
+    FILE *f = check_file(L, 1, NULL);
+    if (-1 == fstat(fileno(f), &st))
+      return push_error(L);
+    } break;
+  }
+  if (lua_type(L, 2) != LUA_TTABLE) {
+    lua_settop(L, 1);
+    new_dirent(L);
+  }
+  else {
+    lua_settop(L, 2);
+  }
+  if (S_ISDIR(st.st_mode))
+    lua_pushliteral(L, "directory");
+  else
+    lua_pushliteral(L, "file");
+  lua_setfield(L, 2, "type");
+  lua_pushnumber(L, st.st_size);
+  lua_setfield(L, 2, "size");
+  return 1;
+}
+
+/* ...diriter... -- ...diriter... pathname */
+static int diriter_getpathname(lua_State *L, int index)
+{
+  lua_pushvalue(L, index);
+  lua_gettable(L, LUA_REGISTRYINDEX);
+  return 1;
+}
+
+/* ...diriter... pathname -- ...diriter... */
+static int diriter_setpathname(lua_State *L, int index)
+{
+  size_t len;
+  const char *path = lua_tolstring(L, -1, &len);
+  if (path && path[len - 1] != *LUA_DIRSEP) {
+    lua_pushliteral(L, LUA_DIRSEP);
+    lua_concat(L, 2);
+  }
+  lua_pushvalue(L, index);              /* ... pathname diriter */
+  lua_insert(L, -2);                    /* ... diriter pathname */
+  lua_settable(L, LUA_REGISTRYINDEX);   /* ... */
+  return 0;
+}
+
+/* diriter -- diriter */
+static int diriter_close(lua_State *L)
+{
+  DIR **pd = lua_touserdata(L, 1);
+  if (*pd) {
+    closedir(*pd);
+    *pd = 0;
+  }
+  lua_pushnil(L);
+  diriter_setpathname(L, 1);
+  return 0;
+}
+
+static int isdotfile(const char *name)
+{
+  return name[0] == '.' && (name[1] == '\0'
+         || (name[1] == '.' && name[2] == '\0'));
+}
+
+/* pathname -- iter state nil */
+/* diriter ... -- entry */
+int lc_dir(lua_State *L)
+{
+  const char *pathname;
+  DIR **pd;
+  struct dirent *d;
+  switch (lua_type(L, 1)) {
+  default: return luaL_error(L, "expected pathname for argument %d, got dir", 1);
+  case LUA_TSTRING:
+    pathname = lua_tostring(L, 1);
+    lua_pushcfunction(L, lc_dir);       /* pathname ... iter */
+    pd = lua_newuserdata(L, sizeof *pd);/* pathname ... iter state */
+    *pd = opendir(pathname);
+    if (!*pd) return push_error(L);
+    luaL_getmetatable(L, DIR_HANDLE);   /* pathname ... iter state M */
+    lua_setmetatable(L, -2);            /* pathname ... iter state */
+    lua_pushvalue(L, 1);                /* pathname ... iter state pathname */
+    diriter_setpathname(L, -2);         /* pathname ... iter state */
+    return 2;
+  case LUA_TUSERDATA:
+    pd = luaL_checkudata(L, 1, DIR_HANDLE);
+    do d = readdir(*pd);
+    while (d && isdotfile(d->d_name));
+    if (!d) { diriter_close(L); return push_error(L); }
+    new_dirent(L);                      /* diriter ... entry */
+    diriter_getpathname(L, 1);          /* diriter ... entry dir */
+    lua_pushstring(L, d->d_name);       /* diriter ... entry dir name */
+    lua_pushvalue(L, -1);               /* diriter ... entry dir name name */
+    lua_setfield(L, -4, "name");        /* diriter ... entry dir name */
+    lua_concat(L, 2);                   /* diriter ... entry fullpath */
+    lua_replace(L, 1);                  /* fullpath ... entry */
+    lua_replace(L, 2);                  /* fullpath entry ... */
+    return lc_dirent(L);
+  }
+  /*NOTREACHED*/
 }
 
 #endif // USE_POSIX

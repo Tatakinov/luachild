@@ -21,15 +21,22 @@
 #endif
 #endif
 
+#define DIR_HANDLE "DIR*"
+int lc_dirent(lua_State *L);
+int lc_dir(lua_State *L);
+
 #define PROCESS_HANDLE "process"
 
 int lc_pipe(lua_State *L);
 int lc_setenv(lua_State *L);
 int lc_environ(lua_State *L);
+int lc_currentdir(lua_State *L);
+int lc_chdir(lua_State *L);
 int lc_spawn(lua_State *L);
+int process_terminate(lua_State *L);
 int process_wait(lua_State *L);
-int diriter_close(lua_State *L);
 int process_tostring(lua_State *L);
+int process_gc(lua_State *L);
 
 int lua_report_type_error(lua_State *L, int narg, const char * tname);
 size_t lua_value_length(lua_State *L, int index);

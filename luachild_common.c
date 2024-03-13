@@ -18,6 +18,9 @@ int set_table_field(lua_State *L, const char * field_name){
 
 SHFUNC int luaopen_luachild(lua_State *L)
 {
+
+  /* Dirent methods */
+  luaL_newmetatable(L, DIR_HANDLE);
   
   /* Process methods */
 
@@ -25,6 +28,12 @@ SHFUNC int luaopen_luachild(lua_State *L)
 
   lua_pushcfunction(L, process_tostring);
   set_table_field(L, "__tostring");
+
+  lua_pushcfunction(L, process_gc);
+  set_table_field(L, "__gc");
+
+  lua_pushcfunction(L, process_terminate);
+  set_table_field(L, "terminate");
 
   lua_pushcfunction(L, process_wait);
   set_table_field(L, "wait");
@@ -45,8 +54,23 @@ SHFUNC int luaopen_luachild(lua_State *L)
   lua_pushcfunction(L, lc_environ);
   set_table_field(L, "environ");
 
+  lua_pushcfunction(L, lc_currentdir);
+  set_table_field(L, "currentdir");
+
+  lua_pushcfunction(L, lc_chdir);
+  set_table_field(L, "chdir");
+
+  lua_pushcfunction(L, lc_dirent);
+  set_table_field(L, "dirent");
+
+  lua_pushcfunction(L, lc_dir);
+  set_table_field(L, "dir");
+
   lua_pushcfunction(L, lc_spawn);
   set_table_field(L, "spawn");
+
+  lua_pushcfunction(L, process_terminate);
+  set_table_field(L, "terminate");
 
   lua_pushcfunction(L, process_wait);
   set_table_field(L, "wait");
