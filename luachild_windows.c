@@ -221,8 +221,6 @@ static struct spawn_params *spawn_param_init(lua_State *L)
   p->L = L;
   p->cmdline = p->environment = 0;
   p->si = si;
-  p->si.dwFlags = STARTF_USESHOWWINDOW;
-  p->si.wShowWindow = SW_HIDE;
   return p;
 }
 
@@ -448,6 +446,11 @@ static void get_redirect(lua_State *L,
   lua_pop(L, 1);
 }
 
+static void spawn_param_hide(struct spawn_params *p) {
+  p->si.dwFlags = STARTF_USESHOWWINDOW;
+  p->si.wShowWindow = SW_HIDE;
+}
+
 /* filename [args-opts] -- proc/nil error */
 /* args-opts -- proc/nil error */
 int lc_spawn(lua_State *L)
@@ -518,6 +521,14 @@ int lc_spawn(lua_State *L)
       spawn_param_env(params);          /* cmd opts ... */
       break;
     }
+    lua_getfield(L, 2, "hide");
+    if (lua_isboolean(L, -1)) {
+      int hide = lua_toboolean(L, -1);
+      if (hide) {
+        spawn_param_hide(params);
+      }
+    }
+    lua_pop(L, 1);
     get_redirect(L, 2, "stdin", params);    /* cmd opts ... */
     get_redirect(L, 2, "stdout", params);   /* cmd opts ... */
     get_redirect(L, 2, "stderr", params);   /* cmd opts ... */
